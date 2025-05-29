@@ -1,0 +1,21 @@
+[tool.flake8]
+max-line-length = 88
+extend-ignore = "E203,W503" # E203: whitespace before ':', W503: line break before binary operator
+exclude = [
+    ".venv",
+    "__pycache__",
+    "docs",
+    "build",
+    "dist",
+    "results" # Exclude the default output directory for test results
+]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "scripts"] # Add project root and scripts to PYTHONPATH
+asyncio_mode = "auto"
+testpaths = [
+    "tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pydantic_settings:", # Ignore potential pydantic_settings warnings for now
+]

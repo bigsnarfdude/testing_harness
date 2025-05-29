@@ -11,24 +11,43 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Tuple, Dict, Optional, Any
 import asyncio
+import threading
 
 import pandas as pd
 from langchain_ollama import OllamaLLM
 from pydantic import BaseModel, Field, ConfigDict
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+from fastapi import FastAPI
+import uvicorn
 from rich.table import Table
+from pydantic_settings import BaseSettings
 
-class Config:
-    """Configuration settings for the testing harness."""
-    MAX_RETRIES = 4
-    RATE_LIMIT_DELAY = 1.0
-    MAX_WORKERS = 4
-    BATCH_SIZE = 5
-    REQUEST_TIMEOUT = 30.0
-    RETRY_DELAY = 2.0
-    CSV_PATTERN = "*.csv"
-    CONSOLE = Console()
+# Initialize console globally
+CONSOLE = Console()
+
+class AppConfig(BaseSettings):
+    """Configuration settings for the testing harness, loaded from env vars and defaults."""
+    max_retries: int = 4
+    rate_limit_delay: float = 1.0
+    max_workers: int = 4 # Currently not used directly, but good for future
+    batch_size: int = 5
+    request_timeout: float = 30.0 # Currently not used directly, but good for future
+    retry_delay: float = 2.0
+    csv_pattern: str = "*.csv"
+    
+    ollama_base_url: str = "http://localhost:11434"
+    model_name: str = "llama3.2:latest"
+    output_dir: str = "results"
+    verbose: bool = False
+    
+    metrics_port: int = 8000
+    metrics_host: str = "0.0.0.0"
+
+    class Config:
+        env_file = ".env" # Optional: for local development to override env vars
+        env_file_encoding = "utf-8"
+        extra = "ignore" # Ignore extra fields from .env or environment
 
 class AnswerChoice(str, Enum):
     """Enumeration of possible answer choices."""
@@ -215,35 +234,45 @@ def parse_model_response(response: str) -> ModelResponse:
 class TestHarness:
     """Main test harness class."""
     
-    def __init__(self, model: AsyncLanguageModel, output_dir: str, verbose: bool = False):
+    def __init__(self, model: AsyncLanguageModel, config: AppConfig):
         self.model = model
-        self.output_dir = output_dir
-        self.verbose = verbose
-        self.console = Config.CONSOLE
-        os.makedirs(output_dir, exist_ok=True)
+        self.config = config
+        self.console = CONSOLE 
+        self.latest_metrics: Optional[Dict[str, Any]] = None
+        os.makedirs(self.config.output_dir, exist_ok=True)
         self._setup_logging()
 
     def _setup_logging(self):
         """Set up logging configuration."""
         from logging.handlers import RotatingFileHandler
+        from pythonjsonlogger import jsonlogger
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.DEBUG if self.config.verbose else logging.INFO)
         
-        log_file = os.path.join(self.output_dir, f"test_run_{datetime.now():%Y%m%d_%H%M%S}.log")
-        formatter = logging.Formatter(
-            "%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
+        # File Handler - JSON
+        log_file = os.path.join(self.config.output_dir, f"test_run_{datetime.now():%Y%m%d_%H%M%S}.log")
+        json_formatter = jsonlogger.JsonFormatter(
+            fmt="%(asctime)s %(levelname)s %(filename)s %(lineno)d %(message)s"
         )
-        
         file_handler = RotatingFileHandler(
             log_file, maxBytes=10*1024*1024, backupCount=5
         )
-        file_handler.setFormatter(formatter)
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        
-        logger = logging.getLogger()
-        logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
+        file_handler.setFormatter(json_formatter)
+        file_handler.setLevel(logging.DEBUG if self.config.verbose else logging.INFO)
         logger.addHandler(file_handler)
+
+        # Console Handler - Human-readable
+        console_formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(console_formatter)
+        if self.config.verbose:
+            console_handler.setLevel(logging.DEBUG)
+        else:
+            console_handler.setLevel(logging.INFO)
         logger.addHandler(console_handler)
 
     async def process_question_batch(
@@ -289,8 +318,8 @@ class TestHarness:
             result.is_correct = model_response.answer == result.options.correct_letter
             
         except Exception as e:
-            if retry_count < Config.MAX_RETRIES:
-                await asyncio.sleep(Config.RETRY_DELAY)
+            if retry_count < self.config.max_retries:
+                await asyncio.sleep(self.config.retry_delay)
                 return await self.evaluate_question(
                     row, question_number, retry_count + 1
                 )
@@ -319,7 +348,7 @@ class TestHarness:
 
     async def run(self, csv_dir: str) -> TestSuite:
         """Run the test harness."""
-        csv_files = glob.glob(os.path.join(csv_dir, Config.CSV_PATTERN))
+        csv_files = glob.glob(os.path.join(csv_dir, self.config.csv_pattern))
         if not csv_files:
             raise ValueError(f"No CSV files found in {csv_dir}")
         
@@ -372,8 +401,8 @@ class TestHarness:
                     
                     questions = list(enumerate(df.iterrows(), 1))
                     
-                    for i in range(0, len(questions), Config.BATCH_SIZE):
-                        batch = questions[i:i + Config.BATCH_SIZE]
+                    for i in range(0, len(questions), self.config.batch_size):
+                        batch = questions[i:i + self.config.batch_size]
                         results = await self.process_question_batch(
                             [(row, qnum) for qnum, (_, row) in batch]
                         )
@@ -384,7 +413,7 @@ class TestHarness:
                             completed=(i + len(batch)) / len(questions) * 100
                         )
                         
-                        await asyncio.sleep(Config.RATE_LIMIT_DELAY)
+                        await asyncio.sleep(self.config.rate_limit_delay)
                 
                 except Exception as e:
                     logging.error(f"Error processing file {csv_file}: {str(e)}")
@@ -393,20 +422,25 @@ class TestHarness:
         if not all_results:
             raise ValueError("No valid results were generated from any CSV files")
         
-        return self._create_test_suite(all_results)
+        test_suite = self._create_test_suite(all_results)
+        self.latest_metrics = test_suite.get_analytics() # Store metrics
+        return test_suite
 
 
     def _create_test_suite(self, results: List[EvaluationResult]) -> TestSuite:
         """Create a test suite from results."""
         test_cases = [TestCase.from_evaluation_result(result) for result in results]
         
+        # Calculate analytics first
+        analytics = self._calculate_analytics(test_cases)
+
         return TestSuite(
             name="Multiple Choice Evaluation",
             description="Evaluation of model performance on multiple choice questions",
             test_cases=test_cases,
             metadata={
                 "timestamp": datetime.now().isoformat(),
-                **self._calculate_analytics(test_cases)
+                **analytics  # Use pre-calculated analytics
             }
         )
 
@@ -425,6 +459,8 @@ class TestHarness:
 
 async def main():
     """Main entry point."""
+    app_config = AppConfig() # Load config from env vars and defaults
+
     parser = argparse.ArgumentParser(
         description="Enhanced testing harness for multiple choice questions."
     )
@@ -436,48 +472,106 @@ async def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="results",
-        help="Directory to save results (default: results)"
+        default=app_config.output_dir,
+        help=f"Directory to save results (default: {app_config.output_dir})"
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
+        default=app_config.verbose, # Set default from app_config
         help="Enable verbose logging"
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="llama3.2:latest",
-        help="Model to use for evaluation"
+        default=app_config.model_name,
+        help=f"Model to use for evaluation (default: {app_config.model_name})"
     )
     parser.add_argument(
         "--base-url",
         type=str,
-        default="http://localhost:11434",
-        help="Base URL for the Ollama API"
+        default=app_config.ollama_base_url,
+        help=f"Base URL for the Ollama API (default: {app_config.ollama_base_url})"
+    )
+    # Example of adding other config items to CLI args
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=app_config.max_retries,
+        help=f"Max retries for a question (default: {app_config.max_retries})"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=app_config.batch_size,
+        help=f"Batch size for processing questions (default: {app_config.batch_size})"
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=app_config.metrics_port,
+        help=f"Port for the metrics server (default: {app_config.metrics_port})"
+    )
+    parser.add_argument(
+        "--metrics-host",
+        type=str,
+        default=app_config.metrics_host,
+        help=f"Host for the metrics server (default: {app_config.metrics_host})"
     )
     
     args = parser.parse_args()
+
+    # Update app_config with any values provided by CLI
+    app_config.output_dir = args.output_dir
+    app_config.verbose = args.verbose
+    app_config.model_name = args.model
+    app_config.ollama_base_url = args.base_url
+    app_config.max_retries = args.max_retries
+    app_config.batch_size = args.batch_size
+    app_config.metrics_port = args.metrics_port
+    app_config.metrics_host = args.metrics_host
     
     model = AsyncOllamaLanguageModel(
-        model=args.model,
-        base_url=args.base_url,
+        model=app_config.model_name, # Use app_config
+        base_url=app_config.ollama_base_url, # Use app_config
         temperature=0.0,
         max_tokens=10,
         stop_sequences=["\n"]
     )
     
-    harness = TestHarness(
-        model=model,
-        output_dir=args.output_dir,
-        verbose=args.verbose
-    )
+    harness = TestHarness(model=model, config=app_config) # Pass app_config
     
+    # Setup FastAPI app
+    metrics_app = FastAPI()
+
+    @metrics_app.get("/metrics")
+    async def get_metrics_endpoint():
+        if harness.latest_metrics:
+            return harness.latest_metrics
+        return {"status": "no metrics available yet"}
+
+    server_config = uvicorn.Config(
+        metrics_app, 
+        host=app_config.metrics_host, 
+        port=app_config.metrics_port, 
+        log_level="info"
+    )
+    server = uvicorn.Server(server_config)
+    
+    # Start the server as a separate task that runs in the background
+    # This allows the harness to continue its operations.
+    # The server will shut down when the main program exits.
+    server_task = asyncio.create_task(server.serve())
+
     try:
+        # Run the harness. This is the primary task.
         test_suite = await harness.run(args.csv_dir)
-        analytics = test_suite.get_analytics()
+        # After harness.run() completes, latest_metrics will be populated.
+        # The metrics endpoint will now serve the actual metrics.
         
-        # Display results using rich
+        # Display results using rich (as before)
+        # Note: get_analytics() is called again here, but latest_metrics is already set
+        analytics = test_suite.get_analytics() 
         table = Table(title="Test Results Summary")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="magenta")
@@ -488,10 +582,18 @@ async def main():
                 f"{value:.2f}" if isinstance(value, float) else str(value)
             )
         
-        Config.CONSOLE.print(table)
+        CONSOLE.print(table) # Use global CONSOLE
         
     finally:
         await model.aclose()
+        # Optionally, explicitly cancel the server task if needed,
+        # though it should stop when the event loop does.
+        if server_task:
+             server_task.cancel()
+             try:
+                 await server_task
+             except asyncio.CancelledError:
+                 logging.info("Metrics server task cancelled.")
 
 if __name__ == "__main__":
     asyncio.run(main())
