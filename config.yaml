@@ -1,0 +1,42 @@
+# Default configuration for Testing Harness
+# This file demonstrates all available configuration options
+
+# Model configuration
+model:
+  provider: ollama  # Currently only 'ollama' is supported
+  model_name: llama3.2:latest  # Model name to use
+  base_url: http://localhost:11434  # Ollama API base URL
+  temperature: 0.0  # Temperature for response generation (0.0 = deterministic)
+  max_tokens: 10  # Maximum tokens in response
+  stop_sequences: ["\n"]  # Stop sequences for response generation
+  timeout: 30.0  # Request timeout in seconds
+  extra_params: {}  # Additional model-specific parameters
+
+# Retry configuration
+retry:
+  max_retries: 4  # Maximum number of retries per question
+  retry_delay: 2.0  # Base delay between retries (seconds)
+  exponential_backoff: true  # Enable exponential backoff
+  backoff_factor: 2.0  # Multiplier for exponential backoff
+
+# Runner configuration
+runner:
+  batch_size: 5  # Number of questions processed in parallel (async mode)
+  max_workers: 4  # Maximum number of worker threads
+  rate_limit_delay: 1.0  # Delay between API calls (seconds)
+  checkpoint_interval: 10  # Save checkpoint every N questions
+  save_partial_results: true  # Save results incrementally
+
+# Logging configuration
+logging:
+  level: INFO  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
+  file_handler: true  # Enable file logging
+  console_handler: true  # Enable console logging
+  max_file_size: 10485760  # Max log file size (10MB)
+  backup_count: 5  # Number of backup log files to keep
+
+# Output configuration
+output_dir: results  # Directory to save results
+output_format: json  # Output format: json or csv
+verbose: false  # Enable verbose output
